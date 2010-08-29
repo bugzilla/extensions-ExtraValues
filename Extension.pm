@@ -68,7 +68,15 @@ sub install_update_db {
         if ($fk) {
             $fk->{TABLE}  = $extra->{ref_table};
             $fk->{COLUMN} = $extra->{ref_column};
-            $dbh->bz_alter_fk($bug_cf_table, 'value', $fk);
+            # 4.1 and above.
+            if ($dbh->can('bz_alter_fk')) {
+                $dbh->bz_alter_fk($bug_cf_table, 'value', $fk);
+            }
+            # Before 4.1
+            else {
+                $dbh->bz_drop_fk($bug_cf_table, 'value');
+                $dbh->bz_add_fk($bug_cf_table, 'value', $fk);
+            }
         }
     }
 }
@@ -77,18 +85,18 @@ sub template_before_process {
     my ($self, $args) = @_;
     my ($vars, $file) = @$args{qw(vars file)};
 
-    if ($file =~ m{bug/(create/create|edit).html.tmpl}) {
-        my $product = exists $vars->{bug} ? $vars->{bug}->product_obj
-                                          : $vars->{product};
+    if ($file eq 'bug/field.html.tmpl') {
+        my $field = $vars->{field};
+        my $product = blessed $vars->{product} ? $vars->{product}
+                                               : $vars->{bug}->product_obj;
 
-        # Overriding legal_values for the extra fields.
-        foreach my $extra_field (Bugzilla->active_custom_fields) {
-            if ($extra_field->name eq 'cf_extra_components') {
-                $extra_field->{legal_values} = $product->components;
-            }
-            elsif ($extra_field->name eq 'cf_extra_versions') {
-                $extra_field->{legal_values} = $product->versions;
-            }
+        if ($field->name eq 'cf_extra_components') {
+            _fix_is_active($product->components);
+            $field->{legal_values} = $product->components;
+        }
+        elsif ($field->name eq 'cf_extra_versions') {
+            _fix_is_active($product->versions);
+            $field->{legal_values} = $product->versions;
         }
     } 
     elsif ($file =~ m{admin/versions/(confirm-delete|list).html.tmpl}) {
@@ -108,9 +116,12 @@ sub template_before_process {
         my $product =
             new Bugzilla::Product({ name => $vars->{product}->{name} });
 
-        foreach my $comp (@{$vars->{product}->components}) {
-            $comp->{bug_count} = _extra_components_bug_count($comp->{name},
+        # In 3.6, {product} is not an object.
+        if (blessed $vars->{product}) {
+            foreach my $comp (@{$vars->{product}->components}) {
+                $comp->{bug_count} = _extra_components_bug_count($comp->{name},
                                                              $product);
+            }
         }
     }
     elsif ($file eq 'admin/table.html.tmpl'
@@ -131,6 +142,20 @@ sub template_before_process {
                 delete $cache->{fields}->{by_name}->{$extra_field->name};
             }
         }
+    }
+}
+
+# Implements visibility for Components and Versions in versions before
+# 4.2.
+sub _fix_is_active {
+    my ($values) = @_;
+    foreach my $object (@$values) {
+        last if $object->can('is_active');
+        $object->{is_active} = 1;
+    }
+    foreach my $object (@$values) {
+        last if $object->can('is_visible_on_bug');
+        $object->{is_visible_on_bug} = sub { 1 };
     }
 }
 
@@ -186,6 +211,44 @@ sub object_validators {
     }
 }
 
+# In 3.6, this is the only way to add new validators.
+sub object_before_create {
+    my ($self, $args) = @_;
+    my ($class, $params) = @$args{qw(class params)};
+    # This means that we're in a version that supports object_validators.
+    return if $class->can('_get_validators');
+    $self->_36_object_validators($class, $params);
+}
+
+sub object_before_set {
+    my ($self, $args) = @_;
+    my $object = $args->{object};
+    # This means that we're in a version that supports object_validators.
+    return if $object->can('_get_validators');
+    $self->_36_object_validators($object);
+}
+
+# We don't want to use the code in object_validators for 3.6. 3.6 doesn't
+# support VALIDATOR_DEPENDENCIES, and it doesn't have validators in
+# VALIDATORS for "component" and "version".
+sub _36_object_validators {
+    my ($self, $invocant, $params) = @_;
+    return unless $invocant->isa('Bugzilla::Bug');
+    my $validators = $invocant->VALIDATORS;
+    my $product;
+    if ($params) {
+        $product = $validators->{product}->($invocant, $params->{product});
+    }
+    $validators->{cf_extra_components} = sub {
+        pop @_;
+        _check_cf_extra_components('_check_component', @_, $product);
+    };
+    $validators->{cf_extra_versions} = sub {
+        pop @_;
+        _check_cf_extra_versions('_check_version', @_, $product);
+    };
+}
+
 sub _check_cf_extra_components {
     my $original = shift;
     my $invocant = shift;
@@ -212,6 +275,7 @@ sub _check_cf_extra_versions {
     return \@checked_values;
 }
 
+# This only works in 4.0 and above.
 sub search_operator_field_override {
     my ($self, $args) = @_;
     my ($class, $operators) = @$args{qw(class operators)};
